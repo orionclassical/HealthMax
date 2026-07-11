@@ -353,6 +353,8 @@ async function getProduct(req, res) {
           description:  alt.description  ?? null,
           source:       alt.source       ?? null,
           where_to_buy: alt.where_to_buy ?? null,
+          nova_group:   alt.nova_group   ?? null,
+          _nutrients:   alt._nutrients   ?? null,
         })),
         ai_nutrition: {
           estimated: aiEstimated,

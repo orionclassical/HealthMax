@@ -9,6 +9,21 @@
  *
  * Env var required:
  *   OPENAI_API_KEY — API key from https://platform.openai.com/api-keys
+ *
+ * CHANGELOG (alternatives fix):
+ *   - Root cause of "chips -> romaine lettuce": when a scanned product has
+ *     no OFF category, categoryLabel fell back to "general", giving the
+ *     model no signal about product FORM. Prompt now derives a form hint
+ *     from the product name itself and hard-bans cross-category swaps.
+ *   - Added dedupe: alternatives can no longer repeat each other or the
+ *     scanned product name.
+ *   - Added nova_group + additives_count to the schema (were hardcoded
+ *     null before), so scoring/frontend table isn't missing data.
+ *   - Switched alternatives call to Structured Outputs (json_schema,
+ *     strict) so malformed/partial JSON can't slip through — removes the
+ *     need for the forgiving-parser fallback path on this call and cuts
+ *     retries.
+ *   - Trimmed max_tokens and prompt verbosity to cut cost/latency.
  */
 
 const OPENAI_MODEL   = 'gpt-4.1-mini';
@@ -24,8 +39,11 @@ class OpenAIQuotaError extends Error {
 }
 
 // ─── Raw OpenAI caller ────────────────────────────────────────────────────────
+// responseFormat is now overridable so we can request Structured Outputs
+// (json_schema + strict) for calls that need a guaranteed shape, while
+// fillMissingNutrients keeps the looser json_object mode it already relies on.
 
-async function callOpenAI(prompt, maxOutputTokens = 2048) {
+async function callOpenAI(prompt, maxOutputTokens = 2048, responseFormat = { type: 'json_object' }) {
   const apiKey = process.env.OPENAI_API_KEY;
 
   if (!apiKey) {
@@ -50,9 +68,7 @@ async function callOpenAI(prompt, maxOutputTokens = 2048) {
     temperature: 0.2,
     max_tokens: maxOutputTokens,
 
-    response_format: {
-      type: 'json_object'
-    }
+    response_format: responseFormat,
   };
 
   const res = await fetch(OPENAI_API_URL, {
@@ -117,7 +133,7 @@ async function callOpenAI(prompt, maxOutputTokens = 2048) {
   return text;
 }
 
-// ─── JSON parser — very forgiving ────────────────────────────────────────────
+// ─── JSON parser — very forgiving (still used by fillMissingNutrients) ───────
 
 function parseOpenAIJSON(text) {
   let clean = text
@@ -170,6 +186,10 @@ function slugify(str) {
     .slice(0, 30);
 }
 
+function normalizeName(str) {
+  return String(str || '').trim().toLowerCase().replace(/\s+/g, ' ');
+}
+
 // ─── Nutrient keys ────────────────────────────────────────────────────────────
 
 const NUTRIENT_KEYS = [
@@ -207,40 +227,15 @@ async function fillMissingNutrients(product) {
     .map(k => `${k}: ${rawNutrients[k]}`)
     .join(', ');
 
-  const prompt = `
-You are a nutrition database expert.
-
-Estimate missing nutrient values per 100g for this food product.
-
-Product: ${name}
-Brand: ${brand || 'Unknown'}
-Category: ${category || 'general'}
-
-Known nutrients per 100g:
-${knownLines || 'none'}
-
-Missing fields to estimate per 100g:
-${missingKeys.join(', ')}
-
-Units:
-- energy_kcal_100g = kcal
-- sugars_100g = g
-- saturated-fat_100g = g
-- sodium_100g = g (NOT mg)
-- fiber_100g = g
-- proteins_100g = g
-
-Return ONLY a flat JSON object containing the missing keys.
-
-Example:
-{
-  "sugars_100g": 8.5,
-  "fiber_100g": 2.1
-}
-`;
+  const prompt = `Nutrition DB expert. Estimate missing per-100g values.
+Product: ${name} | Brand: ${brand || 'Unknown'} | Category: ${category || 'general'}
+Known: ${knownLines || 'none'}
+Missing: ${missingKeys.join(', ')}
+Units: energy_kcal_100g=kcal, sugars_100g=g, saturated-fat_100g=g, sodium_100g=g (not mg), fiber_100g=g, proteins_100g=g
+Return ONLY a flat JSON object with the missing keys, e.g. {"sugars_100g":8.5,"fiber_100g":2.1}`;
 
   try {
-    const text = await callOpenAI(prompt, 512);
+    const text = await callOpenAI(prompt, 300);
 
     const parsed = parseOpenAIJSON(text);
 
@@ -296,6 +291,75 @@ Example:
 
 // ─── 2. Philippines-specific alternatives ────────────────────────────────────
 
+// Guarantees the model returns exactly this shape — no partial/malformed
+// JSON, no missing nutrition fields silently defaulting to null.
+const ALTERNATIVES_SCHEMA = {
+  type: 'json_schema',
+  json_schema: {
+    name: 'ph_alternatives',
+    strict: true,
+    schema: {
+      type: 'object',
+      properties: {
+        alternatives: {
+          type: 'array',
+          minItems: 3,
+          maxItems: 3,
+          items: {
+            type: 'object',
+            properties: {
+              name:                { type: 'string' },
+              brand:               { type: 'string' },
+              where_to_buy:        { type: 'string' },
+              energy_kcal_100g:    { type: 'number' },
+              sugars_100g:         { type: 'number' },
+              saturated_fat_100g:  { type: 'number' },
+              sodium_100g:         { type: 'number' },
+              fiber_100g:          { type: 'number' },
+              proteins_100g:       { type: 'number' },
+              nova_group:          { type: 'number', description: '1-4, NOVA processing classification' },
+              additives_count:     { type: 'number' },
+              reason:              { type: 'string', description: 'Max 12 words.' },
+              description:         { type: 'string', description: 'Max 20 words.' },
+            },
+            required: [
+              'name', 'brand', 'where_to_buy',
+              'energy_kcal_100g', 'sugars_100g', 'saturated_fat_100g',
+              'sodium_100g', 'fiber_100g', 'proteins_100g',
+              'nova_group', 'additives_count', 'reason', 'description',
+            ],
+            additionalProperties: false,
+          },
+        },
+      },
+      required: ['alternatives'],
+      additionalProperties: false,
+    },
+  },
+};
+
+/**
+ * Infers a coarse "product form" from the name when category is missing
+ * or generic. This is what stops the model from drifting into unrelated
+ * food categories (e.g. suggesting produce for a packaged snack) when
+ * category = 'general'.
+ */
+function inferFormHint(name, category) {
+  const lower = `${name} ${category || ''}`.toLowerCase();
+  const forms = [
+    { test: /chip|crisp|cracker/,           label: 'packaged salty snack' },
+    { test: /soda|soft drink|juice|drink/,  label: 'beverage' },
+    { test: /noodle|pancit|instant/,        label: 'instant noodle/meal' },
+    { test: /candy|chocolate|gummy|sweet/,  label: 'confectionery' },
+    { test: /biscuit|cookie|wafer/,         label: 'biscuit/cookie' },
+    { test: /bread|pandesal|loaf/,          label: 'bread/bakery' },
+    { test: /cereal|oats/,                  label: 'breakfast cereal' },
+    { test: /yogurt|milk|dairy/,            label: 'dairy product' },
+  ];
+  const match = forms.find(f => f.test.test(lower));
+  return match ? match.label : null;
+}
+
 async function getPhilippineAlternatives(
   product,
   currentScore = 0
@@ -317,70 +381,56 @@ async function getPhilippineAlternatives(
     .replace(/-/g, ' ')
     .toLowerCase();
 
-  const prompt = `
-Act as a Philippine grocery and nutrition expert.
+  const formHint = inferFormHint(name, category);
 
-List EXACTLY 3 healthier alternatives available in the Philippines.
+  const prompt = `Philippine grocery nutrition expert task.
 
-Product Context:
-- Name: ${name}
-- Brand: ${brand || 'Unknown'}
-- Category: ${categoryLabel}
-- Current Nutrients/100g: ${nutrientSummary || 'unknown'}
+SCANNED ITEM: "${name}" by ${brand || 'unknown brand'}
+CATEGORY: ${categoryLabel}${formHint ? ` (product form: ${formHint})` : ''}
+NUTRIENTS/100g: ${nutrientSummary || 'unknown — infer typical values for this exact product type'}
 
-RULES:
-1. Alternatives MUST stay within the same category.
-2. Alternatives MUST exist in Philippine stores.
-3. Alternatives MUST be nutritionally healthier.
-4. sodium_100g MUST be in grams.
-5. Return ONLY valid JSON.
+Suggest EXACTLY 3 healthier alternatives sold in PH stores.
 
-Return this exact schema:
+STRICT RULES:
+- Alternatives MUST be the same product FORM as the scanned item${formHint ? ` (${formHint})` : ''}. A packaged/processed item must be replaced by another packaged/processed item of the same kind — NEVER substitute raw fruit, vegetables, or an unrelated food category.
+- All 3 alternatives must be different from each other and from "${name}".
+- Each must be genuinely healthier: lower sugar/sodium/saturated fat, higher fiber/protein, or a lower NOVA processing group.
+- sodium_100g in grams, not mg.
+- reason ≤12 words, description ≤20 words.
 
-{
-  "alternatives": [
-    {
-      "name": "Alternative Product Name",
-      "brand": "Brand Name",
-      "where_to_buy": "SM, Puregold",
-      "energy_kcal_100g": 0,
-      "sugars_100g": 0,
-      "saturated_fat_100g": 0,
-      "sodium_100g": 0,
-      "fiber_100g": 0,
-      "proteins_100g": 0,
-      "reason": "One short sentence.",
-      "description": "2-3 sentence nutrition explanation."
-    }
-  ]
-}
-`;
+JSON only, matching the schema exactly.`;
 
   try {
 
-    const text = await callOpenAI(prompt, 2048);
+    const text = await callOpenAI(prompt, 700, ALTERNATIVES_SCHEMA);
 
-    const parsed = parseOpenAIJSON(text);
+    const parsed = JSON.parse(text); // Structured Outputs guarantees valid, schema-conformant JSON
 
-    const alternatives = Array.isArray(parsed)
-      ? parsed
-      : parsed.alternatives;
+    const rawAlternatives = parsed.alternatives || [];
 
-    if (!Array.isArray(alternatives)) {
-      throw new Error(
-        '[OpenAI] Response did not evaluate to a JSON array.'
-      );
+    // Dedupe: against the scanned product and against each other.
+    const seen = new Set([normalizeName(name)]);
+    const deduped = [];
+
+    for (const item of rawAlternatives) {
+      const key = normalizeName(item.name);
+      if (!key || seen.has(key)) continue;
+      seen.add(key);
+      deduped.push(item);
     }
 
-    return alternatives.slice(0, 3).map(item => ({
+    if (deduped.length === 0) {
+      console.warn('[OpenAI] All alternatives were duplicates/invalid — returning none.');
+      return [];
+    }
+
+    return deduped.map(item => ({
 
       barcode: `ph-alternative-${slugify(item.name)}`,
 
-      name:
-        item.name || 'Unknown Alternative',
+      name: item.name || 'Unknown Alternative',
 
-      brand:
-        item.brand || 'Unknown Brand',
+      brand: item.brand || 'Unknown Brand',
 
       image_url: null,
 
@@ -388,43 +438,33 @@ Return this exact schema:
 
       grade: null,
 
-      where_to_buy:
-        item.where_to_buy || 'PH Supermarkets',
+      where_to_buy: item.where_to_buy || 'PH Supermarkets',
 
-      reason:
-        item.reason ||
-        'Healthier choice in this category.',
+      reason: item.reason || 'Healthier choice in this category.',
 
-      description:
-        item.description || '',
+      description: item.description || '',
 
       source: 'openai_ph_alternative',
 
-      nova_group: null,
+      nova_group: toNum(item.nova_group),
 
       _nutrients: {
 
-        energy_kcal_100g:
-          toNum(item.energy_kcal_100g),
+        energy_kcal_100g: toNum(item.energy_kcal_100g),
 
-        sugars_100g:
-          toNum(item.sugars_100g),
+        sugars_100g: toNum(item.sugars_100g),
 
-        'saturated-fat_100g':
-          toNum(item.saturated_fat_100g),
+        'saturated-fat_100g': toNum(item.saturated_fat_100g),
 
-        sodium_100g:
-          toNum(item.sodium_100g),
+        sodium_100g: toNum(item.sodium_100g),
 
-        fiber_100g:
-          toNum(item.fiber_100g),
+        fiber_100g: toNum(item.fiber_100g),
 
-        proteins_100g:
-          toNum(item.proteins_100g),
+        proteins_100g: toNum(item.proteins_100g),
 
-        nova_group: null,
+        nova_group: toNum(item.nova_group),
 
-        additives_tags: [],
+        additives_tags: Array(Math.max(0, Math.round(toNum(item.additives_count) ?? 0))).fill('unspecified'),
       },
     }));
 
